@@ -1,0 +1,200 @@
+#!/usr/bin/env node
+
+process.env.DEBUG = "";
+
+/**
+ * Module dependencies
+ */
+
+var protostore = require('../')
+  , program = require('commander')
+  , connect = require('connect')
+  , through = require('through')
+  , util = require('util')
+  , net = require('net')
+  , http = require('http')
+  , amp = require('amp')
+
+
+var print = process.stdout.write.bind(process.stdout);
+var error = console.error;
+var exit = process.exit;
+var server = null;
+var port = 7346;
+var debug = null;
+
+
+// verbose is NOOP unless the
+// `--verbose` is set in which
+// the debug module is required
+// and the verbose function is
+// redefined
+function verbose () {}
+
+// this will generate a random hex
+// based id that each connection
+// is assigned
+function hexid () {
+  return Math.floor((Math.random() * 10e10)).toString(16);
+}
+
+// simple implementation of printf
+// utilizing util.format
+function printf (fmt /*, ...*/) {
+  print(util.format.apply(this, arguments));
+}
+
+// return the char code at index 0
+function code (s) {
+  return s.charCodeAt(s);
+}
+
+// overload `helpInformation`
+program.helpInformation = function (rc) {
+  return [
+      "usage: protostore [--http|--tcp] [--verbose]"
+    , "                  [--port <port>] [--socket <path>]"
+    , (0 === rc) ? "" : [
+        this.commandHelp()
+       , "options:"
+       , this.optionHelp().replace(/^/gm, '  ')
+      ].join('\n')
+    , ""
+  ].join('\n');
+};
+
+// overload `unknownOption`
+program.unknownOption = function(flag){
+  error("error: unknown option `%s'", flag);
+  print(this.helpInformation(0));
+  print("\n");
+  exit(1);
+};
+
+// init program
+program.version(require('../package').version)
+  .option("-p, --port <port>",    "port to listen on (default: 7346)")
+  .option("-s, --socket <path>",  "socket to listen on")
+  .option("--verbose",            "enable verbose output")
+  .option("--http",               "use http transport")
+  .option("--tcp",                "use tcp transport (default)")
+  .parse(process.argv);
+
+// override port if set
+if (undefined !== program.port) {
+  port = Number(program.port);
+}
+
+// use debug if verbose is enabled
+if (true === program.verbose) {
+  process.env.DEBUG += 'verbose,';
+  debug = require('debug')
+  verbose = debug('verbose');
+  verbose("enabled verbose output");
+}
+
+if (true === program.http) {
+  var app = connect();
+  verbose("using http transport");
+
+  app.use(function (req, res) {
+    var parser = new amp.Stream();
+
+    // request and response streams
+    // will both share a hid
+    req.hid = res.hid = hexid();
+    verbose("connection recieved (%s)", res.hid);
+
+    req.on('end', function () {
+      res.end();
+    });
+
+    req.on('readable', function () {
+      var chunk = null;
+      var head = [];
+      var body = [];
+      var tail = [];
+      var n = -1;
+
+      verbose("connection readable (%s)", req.hid);
+
+      // best: O(n) | worst: O(log n)
+      while (null != (chunk = req.read())) {
+        verbose("got chunk with length '%d'", chunk.length);
+        var parts = String(chunk).split('\n');
+        var part = null;
+
+        // single part request
+        if (1 === parts.length) {
+          res.write(parts[0]);
+          res.end();
+        }
+
+        // this will handle multipart
+        while (null != (part = parts.shift())) {
+          // '\r' or '\n' char codes
+          if (10 === code(part) || 13 === code(part)) {
+            n++;
+            continue;
+          }
+
+          switch (n) {
+            // head
+            case -1:
+              head.push(part);
+              break;
+
+            // body
+            case 0:
+              body.push(part);
+              break;
+
+            // tail
+            case 1:
+              tail.push(part);
+              break;
+          }
+        }
+      }
+
+      res.write(body.join('\n'));
+      res.end();
+    });
+
+  });
+
+  server = http.createServer(app);
+} else {
+  verbose("using tcp transport");
+  server = net.createServer(function (s) {
+    s.hid = hexid();
+    verbose("connection recieved (%s)", s.hid);
+
+    s.on('readable', function () {
+      var chunk = null;
+      var chunks = null;
+      var part = null;
+      var parts = [];
+
+      verbose("connection readable (%s)", s.hid);
+      while (null != (chunk = s.read())) {
+        try { chunks = amp.decode(chunk); }
+        catch (e) { verbose("error (%s): '%s'", s.hid, e); continue; }
+        while (null != (part = chunks.shift())) {
+          parts.push(part);
+        }
+      }
+
+      verbose("got %d part(s) for (%s)", parts.length, s.hid);
+    });
+  });
+}
+
+
+if (undefined !== program.sock) {
+  server.listen(program.sock);
+  verbose("listening on socket '%s'", program.sock);
+} else {
+  server.listen(port);
+  verbose("listening on port '%d'", port);
+}
